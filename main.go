@@ -39,24 +39,23 @@ func run(args []string) error {
 
 	log.Printf("using %d clients to %s", cfg.clientCount, cfg.domain)
 
+	bar := pb.StartNew(cfg.clientCount * 5)
+	defer bar.Finish()
+
 	clients := make([]*client, cfg.clientCount)
 	for i := range clients {
-		c, err := newClient(cfg.domain, cfg.username, cfg.passwort)
+		c, err := newClient(cfg.domain, cfg.username, cfg.passwort, bar)
 		if err != nil {
 			return fmt.Errorf("creating client: %w", err)
 		}
 		clients[i] = c
 	}
 
-	bar := pb.StartNew(cfg.clientCount)
-	defer bar.Finish()
-
 	var wg sync.WaitGroup
 	for _, c := range clients {
 		wg.Add(1)
 		go func(c *client) {
 			defer wg.Done()
-			defer bar.Increment()
 			if err := c.run(); err != nil {
 				log.Printf("Client failed: %v", err)
 			}
@@ -67,18 +66,24 @@ func run(args []string) error {
 	return nil
 }
 
+type incrementer interface {
+	Increment() int
+}
+
 type client struct {
 	domain             string
 	hc                 *http.Client
 	username, password string
+	bar                *pb.ProgressBar
 }
 
 // newClient creates a client object. No requests are sent.
-func newClient(domain, username, password string) (*client, error) {
+func newClient(domain, username, password string, bar *pb.ProgressBar) (*client, error) {
 	c := &client{
 		domain:   "https://" + domain,
 		username: username,
 		password: password,
+		bar:      bar,
 	}
 
 	jar, err := cookiejar.New(nil)
@@ -100,16 +105,27 @@ func (c *client) run() error {
 		return fmt.Errorf("login client: %w", err)
 	}
 
+	c.bar.Increment()
+
+	var wg sync.WaitGroup
+
 	for _, path := range []string{
 		pathWhoami,
 		pathLogin,
 		pathServertime,
 		pathConstants,
 	} {
-		if err := c.get(path); err != nil {
-			return fmt.Errorf("get request to %s: %w", path, err)
-		}
+		wg.Add(1)
+		go func(path string) {
+			defer wg.Done()
+			defer c.bar.Increment()
+			if err := c.get(path); err != nil {
+				log.Printf("Error get request to %s: %v", path, err)
+			}
+		}(path)
 	}
+
+	wg.Wait()
 	return nil
 }
 
