@@ -6,6 +6,7 @@ import (
 	"bufio"
 	"context"
 	"crypto/tls"
+	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
@@ -20,7 +21,8 @@ import (
 	"sync"
 	"time"
 
-	"github.com/cheggaaa/pb/v3"
+	"github.com/vbauerster/mpb/v6"
+	"github.com/vbauerster/mpb/v6/decor"
 )
 
 const (
@@ -74,7 +76,8 @@ func run(ctx context.Context, args []string) error {
 func runBrowser(_ context.Context, cfg *Config) error {
 	log.Printf("using %d clients to %s", cfg.clientCount, cfg.domain)
 
-	bar := pb.StartNew(cfg.clientCount * 5)
+	progress := mpb.New()
+	bar := progress.AddBar(int64(cfg.clientCount) * 5)
 
 	clients := make([]*client, cfg.clientCount)
 	for i := range clients {
@@ -99,7 +102,7 @@ func runBrowser(_ context.Context, cfg *Config) error {
 	}
 
 	wg.Wait()
-	bar.Finish()
+	progress.Wait()
 	log.Printf("Run for %v", time.Now().Sub(start))
 	return nil
 }
@@ -116,12 +119,11 @@ func runKeepOpen(ctx context.Context, cfg *Config) error {
 		return fmt.Errorf("login client: %w", err)
 	}
 
-	var wg sync.WaitGroup
-	for i := 0; i < cfg.clientCount; i++ {
-		wg.Add(1)
-		go func(first bool) {
-			defer wg.Done()
+	progress := mpb.New()
+	changeIDCh := make(chan int, 1)
 
+	for i := 0; i < cfg.clientCount; i++ {
+		go func() {
 			r, err := c.keepOpen(ctx, path)
 			if err != nil {
 				log.Println("Can not create connection: %w", err)
@@ -129,62 +131,74 @@ func runKeepOpen(ctx context.Context, cfg *Config) error {
 			}
 			defer r.Close()
 
-			if first {
-				// TODO: Listen to ctx.Done
-				scanner := bufio.NewScanner(r)
-				scanner.Buffer(make([]byte, 10), 1_000_000)
-				for scanner.Scan() {
-					text := scanner.Text()
-					if len(text) > 50 {
-						text = text[:50] + fmt.Sprintf("... [%d bytes]", len(text))
-					}
-					log.Println(text)
+			// TODO: Listen to ctx.Done
+			scanner := bufio.NewScanner(r)
+			scanner.Buffer(make([]byte, 10), 1_000_000)
+			for scanner.Scan() {
+				if scanner.Text() == `{"connected":true}` {
+					changeIDCh <- 0
+					continue
 				}
-				if err := scanner.Err(); err != nil {
-					if errors.Is(err, context.Canceled) {
-						return
-					}
-					log.Println("Can not read body: %w", err)
+
+				var format struct {
+					ToChangeID int `json:"to_change_id"`
+				}
+				if err := json.Unmarshal(scanner.Bytes(), &format); err != nil {
+					log.Printf("Can not decode json `%s`: %v", scanner.Text(), err)
 					return
 				}
-			} else {
-				readToNothing(ctx, r)
+				changeIDCh <- format.ToChangeID
+			}
+			if err := scanner.Err(); err != nil {
+				if errors.Is(err, context.Canceled) {
+					return
+				}
+				log.Println("Can not read body: %w", err)
+				return
 			}
 
-		}(i == 0)
+		}()
 	}
 
-	wg.Wait()
-	return nil
+	cidToBar := make(map[int]*mpb.Bar)
+
+	for {
+		select {
+		case <-ctx.Done():
+			return nil
+		case cid := <-changeIDCh:
+			bar, ok := cidToBar[cid]
+			if !ok {
+				label := fmt.Sprintf("ChangeID %d", cid)
+				if cid == 0 {
+					label = "First data"
+				}
+				bar = progress.AddBar(int64(cfg.clientCount), mpb.PrependDecorators(decor.Name(label)))
+				cidToBar[cid] = bar
+			}
+			bar.Increment()
+		}
+	}
 }
 
-func readToNothing(ctx context.Context, r io.Reader) {
-	go func() {
-		var err error
-		buf := make([]byte, 1000)
-		for err == nil && ctx.Err() == nil {
-			_, err = r.Read(buf)
-		}
-	}()
-
-	<-ctx.Done()
-	return
+type incrementer interface {
+	Increment()
 }
 
 type client struct {
 	domain             string
 	hc                 *http.Client
 	username, password string
-	bar                *pb.ProgressBar
+	inc                incrementer
 }
 
 // newClient creates a client object. No requests are sent.
-func newClient(domain, username, password string, bar *pb.ProgressBar) (*client, error) {
+func newClient(domain, username, password string, inc incrementer) (*client, error) {
 	c := &client{
 		domain:   "https://" + domain,
 		username: username,
 		password: password,
-		bar:      bar,
+		inc:      inc,
 	}
 
 	jar, err := cookiejar.New(nil)
@@ -206,8 +220,8 @@ func (c *client) browser() error {
 		return fmt.Errorf("login client: %w", err)
 	}
 
-	if c.bar != nil {
-		c.bar.Increment()
+	if c.inc != nil {
+		c.inc.Increment()
 	}
 
 	var wg sync.WaitGroup
@@ -222,8 +236,8 @@ func (c *client) browser() error {
 		go func(path string) {
 			defer wg.Done()
 
-			if c.bar != nil {
-				defer c.bar.Increment()
+			if c.inc != nil {
+				defer c.inc.Increment()
 			}
 
 			if err := c.get(context.Background(), path); err != nil {
