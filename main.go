@@ -108,8 +108,21 @@ func runBrowser(_ context.Context, cfg *Config) error {
 }
 
 func runKeepOpen(ctx context.Context, cfg *Config) error {
-	path := "/system/autoupdate"
-
+	var path string
+	var receivFunc func(string) (string, error)
+	switch cfg.url {
+	case "autoupdate":
+		receivFunc = scannerAutoupdate
+		path = "/system/" + cfg.url
+	case "projector":
+		path = "/system/projector?projector_ids=1"
+		receivFunc = scannerProjector
+	case "notify":
+		path = "/system/" + cfg.url
+		receivFunc = scannerNotify
+	default:
+		return fmt.Errorf("unknown autoupdate-url %s", cfg.url)
+	}
 	c, err := newClient(cfg.domain, cfg.username, cfg.passwort, nil)
 	if err != nil {
 		return fmt.Errorf("creating client: %w", err)
@@ -120,7 +133,7 @@ func runKeepOpen(ctx context.Context, cfg *Config) error {
 	}
 
 	progress := mpb.New()
-	changeIDCh := make(chan int, 1)
+	received := make(chan string, 1)
 
 	for i := 0; i < cfg.clientCount; i++ {
 		go func() {
@@ -135,21 +148,15 @@ func runKeepOpen(ctx context.Context, cfg *Config) error {
 			scanner := bufio.NewScanner(r)
 			scanner.Buffer(make([]byte, 10), 1_000_000)
 			for scanner.Scan() {
-				if scanner.Text() == `{"connected":true}` {
-					changeIDCh <- 0
+				msg, err := receivFunc(scanner.Text())
+				if err != nil {
+					if errors.Is(err, context.Canceled) {
+						return
+					}
+					log.Printf("Error parsing received data: %v", err)
 					continue
 				}
-
-				var format struct {
-					ToChangeID int `json:"to_change_id"`
-				}
-				if err := json.Unmarshal(scanner.Bytes(), &format); err != nil {
-					if ctx.Err() != nil {
-						log.Printf("Can not decode json : %v", err)
-					}
-					return
-				}
-				changeIDCh <- format.ToChangeID
+				received <- msg
 			}
 			if err := scanner.Err(); err != nil {
 				if errors.Is(err, context.Canceled) {
@@ -162,25 +169,55 @@ func runKeepOpen(ctx context.Context, cfg *Config) error {
 		}()
 	}
 
-	cidToBar := make(map[int]*mpb.Bar)
+	cidToBar := make(map[string]*mpb.Bar)
 
 	for {
 		select {
 		case <-ctx.Done():
 			return nil
-		case cid := <-changeIDCh:
-			bar, ok := cidToBar[cid]
+		case msg := <-received:
+			bar, ok := cidToBar[msg]
 			if !ok {
-				label := fmt.Sprintf("ChangeID %d", cid)
-				if cid == 0 {
-					label = "First data"
-				}
-				bar = progress.AddBar(int64(cfg.clientCount), mpb.PrependDecorators(decor.Name(label)))
-				cidToBar[cid] = bar
+				bar = progress.AddBar(int64(cfg.clientCount), mpb.PrependDecorators(decor.Name(msg)))
+				cidToBar[msg] = bar
 			}
 			bar.Increment()
 		}
 	}
+}
+
+func scannerAutoupdate(line string) (string, error) {
+	if line == `{"connected":true}` {
+		return "connect", nil
+	}
+
+	var format struct {
+		ToChangeID int `json:"to_change_id"`
+	}
+	if err := json.Unmarshal([]byte(line), &format); err != nil {
+		return "", fmt.Errorf("decode json: %v", err)
+	}
+	return fmt.Sprintf("change id %d", format.ToChangeID), nil
+}
+
+func scannerProjector(line string) (string, error) {
+	var format struct {
+		ToChangeID int `json:"change_id"`
+	}
+	if err := json.Unmarshal([]byte(line), &format); err != nil {
+		return "", fmt.Errorf("decode json: %v", err)
+	}
+	return fmt.Sprintf("change id %d", format.ToChangeID), nil
+}
+
+func scannerNotify(line string) (string, error) {
+	var format struct {
+		Name string `json:"name"`
+	}
+	if err := json.Unmarshal([]byte(line), &format); err != nil {
+		return "", fmt.Errorf("decode json: %v", err)
+	}
+	return fmt.Sprintf("notify name %s", format.Name), nil
 }
 
 type incrementer interface {
@@ -317,6 +354,7 @@ type Config struct {
 	domain      string
 	username    string
 	passwort    string
+	url         string
 }
 
 func loadConfig(args []string) (*Config, error) {
@@ -327,6 +365,7 @@ func loadConfig(args []string) (*Config, error) {
 	f.StringVar(&cfg.domain, "d", "localhost:8000", "host and port of the server to test")
 	f.StringVar(&cfg.username, "u", "admin", "username to use for login")
 	f.StringVar(&cfg.passwort, "p", "admin", "password to use for login")
+	f.StringVar(&cfg.url, "url", "autoupdate", "only for the `connect` test. autoupdate, projector or notify")
 
 	test := f.String("t", "", "testcase [browser,connect]")
 
