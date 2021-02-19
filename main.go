@@ -120,7 +120,7 @@ func runKeepOpen(cfg *Config) error {
 			if first {
 				// TODO: Listen to ctx.Done
 				scanner := bufio.NewScanner(r)
-				scanner.Buffer(make([]byte, 10), 1_000_000)
+				scanner.Buffer(make([]byte, 10), 1000000)
 				for scanner.Scan() {
 					text := scanner.Text()
 					if len(text) > 50 {
