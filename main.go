@@ -144,7 +144,9 @@ func runKeepOpen(ctx context.Context, cfg *Config) error {
 					ToChangeID int `json:"to_change_id"`
 				}
 				if err := json.Unmarshal(scanner.Bytes(), &format); err != nil {
-					log.Printf("Can not decode json `%s`: %v", scanner.Text(), err)
+					if ctx.Err() != nil {
+						log.Printf("Can not decode json : %v", err)
+					}
 					return
 				}
 				changeIDCh <- format.ToChangeID
