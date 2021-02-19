@@ -6,6 +6,7 @@ import (
 	"bufio"
 	"context"
 	"crypto/tls"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -14,6 +15,7 @@ import (
 	"net/http"
 	"net/http/cookiejar"
 	"os"
+	"os/signal"
 	"strings"
 	"sync"
 	"time"
@@ -29,13 +31,26 @@ const (
 )
 
 func main() {
-	if err := run(os.Args); err != nil {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	go func() {
+		c := make(chan os.Signal, 1)
+		signal.Notify(c, os.Interrupt)
+		<-c
+		cancel()
+	}()
+
+	if err := run(ctx, os.Args); err != nil {
+		if errors.Is(err, context.Canceled) {
+			return
+		}
 		log.Printf("Error: %v", err)
 		os.Exit(1)
 	}
 }
 
-func run(args []string) error {
+func run(ctx context.Context, args []string) error {
 	cfg, err := loadConfig(args[1:])
 	if err != nil {
 		return fmt.Errorf("loading config: %w", err)
@@ -43,9 +58,9 @@ func run(args []string) error {
 
 	switch cfg.testCase {
 	case testBrowser:
-		err = runBrowser(cfg)
+		err = runBrowser(ctx, cfg)
 	case testConnect:
-		err = runKeepOpen(cfg)
+		err = runKeepOpen(ctx, cfg)
 	default:
 		err = fmt.Errorf("unknown testCase")
 	}
@@ -56,7 +71,7 @@ func run(args []string) error {
 	return nil
 }
 
-func runBrowser(cfg *Config) error {
+func runBrowser(_ context.Context, cfg *Config) error {
 	log.Printf("using %d clients to %s", cfg.clientCount, cfg.domain)
 
 	bar := pb.StartNew(cfg.clientCount * 5)
@@ -89,7 +104,7 @@ func runBrowser(cfg *Config) error {
 	return nil
 }
 
-func runKeepOpen(cfg *Config) error {
+func runKeepOpen(ctx context.Context, cfg *Config) error {
 	path := "/system/autoupdate"
 
 	c, err := newClient(cfg.domain, cfg.username, cfg.passwort, nil)
@@ -100,9 +115,6 @@ func runKeepOpen(cfg *Config) error {
 	if err := c.login(); err != nil {
 		return fmt.Errorf("login client: %w", err)
 	}
-
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
 
 	var wg sync.WaitGroup
 	for i := 0; i < cfg.clientCount; i++ {
@@ -120,7 +132,7 @@ func runKeepOpen(cfg *Config) error {
 			if first {
 				// TODO: Listen to ctx.Done
 				scanner := bufio.NewScanner(r)
-				scanner.Buffer(make([]byte, 10), 1000000)
+				scanner.Buffer(make([]byte, 10), 1_000_000)
 				for scanner.Scan() {
 					text := scanner.Text()
 					if len(text) > 50 {
@@ -129,6 +141,9 @@ func runKeepOpen(cfg *Config) error {
 					log.Println(text)
 				}
 				if err := scanner.Err(); err != nil {
+					if errors.Is(err, context.Canceled) {
+						return
+					}
 					log.Println("Can not read body: %w", err)
 					return
 				}
